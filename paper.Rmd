@@ -1,0 +1,965 @@
+---
+title: "Reconciled boosted models for GEFCom2017 hierarchical probabilistic load forecasting"
+author: Cameron Roach
+fontsize: 11pt
+papersize: a4
+# fontfamily: kpfonts
+bibliography: ["library.bib", "packages.bib"]
+biblio-style: authoryear-comp
+subparagraph: true
+toc: false
+output: 
+  bookdown::pdf_document2:
+    fig_caption: yes
+    fig_height: 5
+    fig_width: 9
+    # includes:
+    #   in_header: anon-preamble.tex
+    keep_tex: yes
+    number_sections: yes
+    citation_package: biblatex
+---
+
+\begin{abstract}
+  When forecasting time series in a hierarchical configuration it is necessary to ensure that forecasts reconcile at all levels. The 2017 Global Energy Forecasting Competition (GEFCom2017) focused on addressing this topic. Quantile forecasts for eight zones and two aggregated zones in New England were required for every hour of a future month. This paper presents a new methodology for forecasting quantiles in a hierarchy which outperforms a commonly used benchmark model. A simulation-based approach was used to generate demand forecasts. Adjustments were made to each of the demand simulations to ensure all zonal forecasts reconciled appropriately. To ensure bottom level zonal forecasts correctly sum to aggregated zonal forecasts a weighted reconciliation approach was implemented. We show that reconciling in this manner improves forecast accuracy. A discussion of results and modelling performance is presented. Brief reviews of hierarchical time series forecasting and gradient boosting are also included.
+\end{abstract}
+
+<!-- \begin{keywords} -->
+<!--   Hierarchical time series, probabilistic forecasting, forecast combination, reconciling forecasts, electric load forecasting, residual simulation, gradient boosting, machine learning, GEFCom2017 -->
+<!-- \end{keywords} -->
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.align = "center",
+	message = FALSE,
+	warning = FALSE,
+	# dev = "png",
+	# dpi = 150
+	dev = "pdf"
+)
+# fig.width = 10,
+# fig.width = 6
+
+
+# run this manually to generate R package citations
+#knitr::write_bib(c("base", "caret", "xgboost"), "./gefcom-2017/packages.bib", width = 60)
+
+rm(list=ls())
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(scales)
+#library(doMC)
+library(gefcom2017)
+library(knitr)
+library(myhelpr)
+library(GGally)
+
+ba_palette <- c("#3d6b78", "#60bb6b", "#d52f59", "#f5b835", "#2dbbd6",
+                "#816b93", "#b84f80", "#f08c3e", "#c1b97d", "#7e450a",
+                "#d4d700", "#00978f")
+ba_palette_ramp <- colorRampPalette(ba_palette)
+theme_set(theme_bw() +
+            theme(strip.background = element_blank()))
+ggplot <- function(...) {
+  ggplot2::ggplot(...) + 
+    scale_colour_manual(values = ba_palette) +
+    scale_fill_manual(values = ba_palette)
+}
+
+#registerDoMC(cores = 11)
+set.seed(12345)
+
+cache_dir <- "./cache/bkp-2-month-fcst-gap" # knitr
+#cache_dir <- "./gefcom-2017/cache" # console
+results_file <- file.path(cache_dir, "results_may.RData")
+model_file <- file.path(cache_dir, "models_may.RData")
+
+
+#### Inputs ====
+# Zone variables
+load_zones_ma <- c("SEMASS", "WCMASS", "NEMASSBOST")
+load_zones <- c("ME", "NH", "VT", "CT", "RI", load_zones_ma)
+agg_zones <- c("TOTAL", "MASS")
+all_zones <- c("TOTAL", "ME", "NH", "VT", "CT", "RI", "MASS", load_zones_ma) # hierarchical order
+plot_zones <- c("TOTAL", "VT")
+
+# Modelling options
+hts_recon_method <- "residual_var" #"summing", "mean", "median", "residual_var"
+#n_sims <- 100 # not used anymore
+
+forecast_months <- data_frame(
+  Month = c(month.name[5:12], month.name[1:4]),
+  Year = c(rep(2016, 8), rep(2017, 4)),
+  fcst_start_date = dmy("1/5/2016") + months(0:11),
+  fcst_end_date = dmy("1/6/2016") + months(0:11) - 1,
+  cached_model_file = paste0("models_", c(month.abb[5:12], month.abb[1:4]), ".RData")
+)
+
+
+# Load results if they exist
+load(file.path(cache_dir, "results.RData"))
+```
+
+
+```{r fit-models, eval = FALSE}
+for (iM in forecast_months$Month) {
+  # Forecast period
+  fcst_start_date <- filter(forecast_months, Month == iM) %>% pull(fcst_start_date)
+  fcst_end_date <- filter(forecast_months, Month == iM) %>% pull(fcst_end_date)
+  
+  # Training periods for models
+  train_start_date <- dmy("1/1/2005")
+  train_end_date <- fcst_start_date - months(2) - days(1)
+  trend_start <- as.numeric(ymd(train_start_date, tz = "UTC"))/3600
+  
+  output <- get_train_test_df(train_start_date, train_end_date, 
+                              fcst_start_date, fcst_end_date, trend_start)
+  list2env(output, envir = environment())
+  rm(output)
+  
+  xgb_fit <- fit_models(train_df, all_zones)
+  save(xgb_fit, file = file.path(cache_dir,
+                                 filter(forecast_months, Month == iM) %>%
+                                   pull(cached_model_file)))
+  rm(train_df, test_df, xgb_fit)
+}
+```
+
+```{r do-forecasts, eval = FALSE}
+quantile_fcst_xgb <- list()
+quantile_fcst_vanilla <- list()
+results_xgb <- NULL
+results_vanilla <- NULL
+resid_df_train <- list()
+resid_df_test <- list()
+fcst_bs_df <- list()
+for (iM in forecast_months$Month) {
+  # Forecast period
+  fcst_start_date <- filter(forecast_months, Month == iM) %>% pull(fcst_start_date)
+  fcst_end_date <- filter(forecast_months, Month == iM) %>% pull(fcst_end_date)
+  
+  # Training periods for models
+  train_start_date <- dmy("1/1/2005")
+  train_end_date <- fcst_start_date - months(2) - days(1)
+  trend_start <- as.numeric(ymd(train_start_date, tz = "UTC"))/3600
+  
+  output <- get_train_test_df(train_start_date, train_end_date, 
+                              fcst_start_date, fcst_end_date, trend_start)
+  list2env(output, envir = environment())
+  rm(output)
+  
+  load(file.path(cache_dir,
+                 filter(forecast_months, Month == iM) %>% 
+                   pull(cached_model_file)))
+  
+  #### calculate residuals for historical demand and predictions ====
+  # Manually specify which variables we want to avoid including predictors 
+  # in case aggregated zones use different predictors.
+  resid_df_vars <- c("ts", "Date", "DoY", "DoW", "Year", "Hour", "Period",
+                     "Zone", "Holiday", "Holiday_flag", "Demand", "Prediction")
+  for (iZ in all_zones) {
+    resid_df_train[[iM]] <- train_df %>% 
+      filter(Zone == iZ) %>% 
+      data.frame(.,
+                 Prediction = predict(xgb_fit[[iZ]][["XGB"]], .)) %>% 
+      select(one_of(resid_df_vars)) %>% 
+      mutate(Residual = Demand - Prediction) %>% 
+      bind_rows(resid_df_train[[iM]])
+    
+    if (dim(test_df)[1] != 0) {
+      resid_df_test[[iM]] <- test_df %>% 
+        filter(Zone == iZ) %>% 
+        data.frame(.,
+                   Prediction = predict(xgb_fit[[iZ]][["XGB"]], .)) %>% 
+        select(one_of(resid_df_vars)) %>% 
+        mutate(Residual = Demand - Prediction) %>% 
+        bind_rows(resid_df_test[[iM]])
+    }
+  }
+  
+  #### Weather simulations ====
+  weather_sims <- train_df %>%
+    group_by(Zone) %>%
+    do(shuffle_weather(., fcst_start_date, fcst_end_date, trend_start))
+  
+  #### Demand simulations ======
+  fcst_bs_df_vars <- c("Simulation", "ts", "Date", "Hour", "DoY", "DoW", "Year", 
+                       "Month", "Period", "Zone", "Holiday", "Holiday_flag",
+                       "Weekend", "Prediction")
+  
+  fcst_vanilla <- NULL
+  for (iZ in all_zones) {
+    fcst_bs_df[[iM]] <- weather_sims %>% 
+      filter(Zone == iZ) %>% 
+      data.frame(.,
+                 Prediction = predict(xgb_fit[[iZ]][["XGB"]], .)) %>% 
+      select(one_of(fcst_bs_df_vars)) %>% 
+      bind_rows(fcst_bs_df[[iM]])
+    
+    fcst_vanilla <- weather_sims %>% 
+      filter(Zone == iZ) %>% 
+      data.frame(.,
+                 Prediction = predict(xgb_fit[[iZ]][["Vanilla"]], .)) %>% 
+      bind_rows(fcst_vanilla)
+  }
+  
+  
+  
+  #### bootstrap residuals ====
+  resid_dates <- NULL
+  for (iS in unique(fcst_bs_df[[iM]]$Simulation)) {
+    tmp <- sample_sequence_similar_days(
+      fcst_dates = seq(fcst_start_date, fcst_end_date, by = 1),
+      resid_dates = resid_df_train[[iM]] %>% 
+        select(Date, Holiday_flag) %>% 
+        distinct(),
+      min_block_length = 14,
+      max_block_length = 21)
+    
+    resid_dates <- data_frame(Simulation = iS,
+                              Date = tmp$Date,
+                              Resid_date = tmp$Resid_date) %>% 
+      bind_rows(resid_dates)
+  }
+  
+  
+  fcst_bs_df[[iM]] <- fcst_bs_df[[iM]] %>%
+    inner_join(resid_dates) %>% 
+    inner_join(select(resid_df_train[[iM]], Resid_date = Date, Residual, Zone,
+                      Period)) %>% 
+    mutate(Prediction_adj = Prediction + Residual) %>% 
+    select(-Resid_date)
+  
+  
+  # Hierarchical reconciliation
+  S <- matrix(ncol = 8, nrow = 10, byrow = TRUE,
+              c(1,1,1,1,1,1,1,1,
+                1,0,0,0,0,0,0,0,
+                0,1,0,0,0,0,0,0,
+                0,0,1,0,0,0,0,0,
+                0,0,0,1,0,0,0,0,
+                0,0,0,0,1,0,0,0,
+                0,0,0,0,0,1,1,1,
+                0,0,0,0,0,1,0,0,
+                0,0,0,0,0,0,1,0,
+                0,0,0,0,0,0,0,1))
+  
+  y_mean <- sapply(all_zones,
+                   function(x) {
+                     mean(train_df[train_df$Zone == x,]$Demand)
+                   }, simplify = TRUE, USE.NAMES = FALSE)
+  W_mean <- diag(sum(y_mean) / y_mean)
+  
+  y_median <- sapply(all_zones,
+                     function(x) {
+                       median(train_df[train_df$Zone == x,]$Demand)
+                     }, simplify = TRUE, USE.NAMES = FALSE)
+  W_median <- diag(sum(y_median) / y_median)
+  
+  y_res_var <- sapply(all_zones,
+                      function(x) {
+                        var(resid_df_train[[iM]][resid_df_train[[iM]]$Zone == x, "Residual"])
+                      }, simplify = TRUE, USE.NAMES = FALSE)
+  W_res_var <- diag(1/y_res_var)
+  
+  
+  hts_bs_recon_list <- hts_reconciliation(
+    fcst_bs_df[[iM]], S, W_mean, W_median, W_res_var, 
+    prediction_col = "Prediction_adj",
+    variable_cols = c("Simulation", "ts", "Date", "Hour")
+  )
+  
+  # Choose preferred forecast reconciliation
+  hts_rec <- hts_bs_recon_list[[hts_recon_method]]
+  names(hts_rec)[starts_with("Prediction_rec", vars = names(hts_rec))] <- "Prediction_rec"
+  
+  # Reconcile test residuals if present
+  if (dim(test_df)[1] != 0) {
+    hts_resid_recon_list <- hts_reconciliation(
+      resid_df_test[[iM]], S, W_mean, W_median, W_res_var, prediction_col = "Prediction", 
+      variable_cols = c("ts", "Date", "Hour")
+    )
+    
+    # Put all historical reconciliations into a data frame for analysis later.
+    resid_df_test[[iM]] <- resid_df_test[[iM]] %>% 
+      inner_join(hts_resid_recon_list$summing) %>% 
+      inner_join(hts_resid_recon_list$mean) %>% 
+      inner_join(hts_resid_recon_list$median) %>% 
+      inner_join(hts_resid_recon_list$residual_var)
+  }
+  
+  
+  # Get results data frames
+  for (iZ in all_zones) {
+    results_xgb <- data.frame(FCST_MONTH = iM,
+                              Zone = iZ,
+                              xgb_fit[[iZ]][["XGB"]]$results) %>% 
+      bind_rows(results_xgb, .)
+    results_vanilla <- data.frame(FCST_MONTH = iM,
+                                  Zone = iZ,
+                                  xgb_fit[[iZ]][["Vanilla"]]$results) %>% 
+      bind_rows(results_vanilla, .)
+  }
+  
+  # calc quantiles
+  quantile_fcst_xgb[[iM]] <- get_quantiles(hts_rec, "Prediction_rec")
+  quantile_fcst_vanilla[[iM]] <- get_quantiles(fcst_vanilla, "Prediction")
+}
+
+quantile_fcst_xgb <- bind_rows(quantile_fcst_xgb, .id = "FCST_MONTH")
+quantile_fcst_vanilla <- bind_rows(quantile_fcst_vanilla, .id = "FCST_MONTH")
+
+save.image(file.path(cache_dir, "results.RData"))
+```
+
+
+# Introduction
+
+Hierarchical time series forecasting occurs in situations where a dependent variable of interest can be disaggregated across nodes of a hierarchy. Examples include forecasting sales of a product within towns and also by state; forecasting economic indicators within states and for an entire country; and in this case, forecasting demand in bottom level and aggregated zones of an electricity network. When forecasting hierarchical time series, the base forecasts typically do not reconcile as one would expect. Forecasts of electricity demand in each of the bottom level zones may not sum up to the forecasts of aggregated zones. Hence, it is often necessary to carry out a reconciliation step to adjust these base forecasts.
+
+In this paper I propose a methodology for hierarchical forecasting of electricity demand across eight zones in New England. In addition to the eight bottom level zones, electricity demand for two aggregated zones are also forecast. This methodology was used in GEFCom2017 in the defined data track. Electricity and weather data were supplied by ISO New England. As this was the defined data track, only electricity demand, dew point temperature, dry bulb temperature and calendar data were allowed as model inputs. We were presented with an ex-ante forecasting problem requiring forecasts of the 10th, 20th, ... and 90th quantiles of the demand distribution for every hour of a future month for all zones.
+
+To produce quantile forecasts for demand, weather scenarios are simulated for every zone in the forecast month. A demand model is then used to predict demand for every zone and hour over the forecast horizon. Residuals are also simulated and added which produces simulations for actual demand rather than just the conditional mean. Zonal forecasts are then adjusted to ensure they reconcile appropriately within each simulation. Quantiles are calculated for each hour using the reconciled demand simulations.
+
+The boosted demand model is fit using the XGBoost algorithm [@Chen2016-bg]. Regularization with L1 and L2 penalties is applied to avoid over-fitting.
+
+Recent work on hierarchical reconciliation has focused on adjusting base forecasts to obtain reconciled forecasts with improved accuracy [@Hyndman2011-kg; @Wickramasuriya2015-lj; @Hyndman2016-ad]. These methods only focus on adjusting forecasts of the conditional mean. Despite a shift towards probabilistic forecasting in the energy industry [@Hong2016-lo] the literature on reconciling probabilistic forecasts in a hierarchical setting remains limited. To the author's knowledge the only relevant paper is @Ben_Taieb2017-it which proposes a methodology for producing coherent hierarchical probabilistic forecasts of smart meter demand. A contribution of this paper is to enrich the literature on quantile forecasting for hierarchical electricity demand.
+
+The paper has the following structure: Section \@ref(background-theory) provides concise reviews of relevant literature on hierarchical energy forecasting and gradient boosting. Competition data and methodology are described in Sections \@ref(data) and \@ref(methodology). Section \@ref(discussion) discusses the modelling results and concluding remarks are provided in Section \@ref(conclusion).
+
+# Background theory
+
+## Hierarchical forecasting
+
+When several time series exist in a hierarchy it is necessary to ensure forecasts at each level of the hierarchy reconcile in a sensible manner. When time series exist in a hierarchy they can be expressed in terms of a summing matrix $\mathbf{S}$ [@Hyndman2011-kg]. This summing matrix allows for all nodes to be expressed in terms of the bottom level nodes. For an observation occurring at time $t$,
+
+\begin{equation}
+  \mathbf{y}_t = \mathbf{S}\mathbf{y}_{bt},
+  (\#eq:summing-matrix)
+\end{equation}
+
+where $\mathbf{y}_t$ gives the observed values for all aggregated and bottom level nodes and $\mathbf{y}_{bt}$ gives the observed values for only the bottom level nodes.
+
+@Hyndman2011-kg showed base forecasts can be reconciled using only the summing matrix $\mathbf{S}$. At forecast horizon $h$,
+
+\begin{equation}
+  \tilde{\mathbf{y}}_h = \mathbf{S}(\mathbf{S'S})^{-1}\mathbf{S'}\hat{\mathbf{y}}_h,
+  (\#eq:recon-summing)
+\end{equation}
+
+where $\tilde{\mathbf{y}}_h$ are the reconciled forecasts and $\hat{\mathbf{y}}_h$ are the base forecasts. This is referred to as ordinary least squares (OLS) reconciliation and was shown to outperform bottom-up and top-down reconciliation approaches for both simulated and real-world data.
+
+Subsequent studies by @Wickramasuriya2015-lj and @Hyndman2016-ad showed that reconciliation could be improved by incorporating a matrix of weights. A generalized least squares (GLS) approach is given by,
+
+\begin{equation}
+  \tilde{\mathbf{y}}_h = \mathbf{S}(\mathbf{S'} \mathbf{\Sigma}_h^\dagger \mathbf{S})^{-1}\mathbf{S' \Sigma_h^\dagger}\hat{\mathbf{y}}_h,
+  (\#eq:recon-gls)
+\end{equation}
+
+where $\mathbf{\Sigma}_h$ is the covariance matrix of the residuals for forecast horizon $h$ and $\mathbf{\Sigma}_h^\dagger$ is the Moore-Penrose generalized inverse. It is often difficult to calculate $\mathbf{\Sigma}_h$ and so an alternative weighted least squares (WLS) method can be used instead. If we let $\mathbf{W}$ be a diagonal matrix with elements serving as the weights, then the WLS approach is,
+
+\begin{equation}
+  \tilde{\mathbf{y}}_h = \mathbf{S}(\mathbf{S'WS})^{-1}\mathbf{S'W}\hat{\mathbf{y}}_h.
+  (\#eq:recon-wls)
+\end{equation}
+
+In @Hyndman2016-ad it was suggested that the diagonal elements of $\mathbf{W}$ could be equal to the inverse of the $h$-step forecast variances. When using an ARIMA time series model the $h$-step ahead forecast variances can be approximated as proportional to the one-step ahead forecast variances. Furthermore, since each fitted value is effectively a one-step ahead forecast, residuals can be used to calculate these variances making \@ref(eq:recon-wls) a practical means for reconciliation. However, this approach is not necessarily feasible when dealing with other model types that do not produce one-step ahead forecasts when fitted to historical values. Given this, in Section \@ref(choosing-weights-for-reconciliation) I propose two alternative weight matrices that can be easily constructed for any model.
+
+## Gradient boosting
+
+Gradient boosting has been used in many machine learning challenges with good results (see for example @Ben_Taieb2014-rr and @Koren2009-pd). Gradient boosting was first proposed by @Schapire1990-yl. A rigorous statistical overview of boosting is carried out by @Friedman2000-st and @Friedman2001-bz. @Chen2016-bg proposed the extreme gradient boosting (XGBoost) algorithm which allowed for easy scaling while using less computational resources.
+
+Essentially, boosting works by training an ensemble of weak learners that are then able to provide better predictions than a single model otherwise would. Suppose we are given a data set with $n$ observations and $p$ predictors, $\left\{ \left( \mathbf{x}_i, y_i \right) \right\}_{i=1}^n$ where $\mathbf{x}_i \in \mathbb{R}^p$ and $y_i \in \mathbb{R}$. Then predictions are given by,
+
+$$
+\hat{y}_i = \phi \left( \mathbf{x}_i \right) = \sum^K_{k=1} \nu f_k \left( \mathbf{x}_i \right), 
+\quad f_k \in \mathcal{F},
+$$
+
+where $K$ is the number of weak learners used, $\nu$ is a shrinkage parameter to control the learning rate and $\mathcal{F}$ is the model space of the weak learners. Each $f_k(\mathbf{x}_i)$ is fit in a stage-wise manner to the residuals $r_i$ of the previous fit. Residuals are initially set equal to the observed response, $r_i = y_i$ for all $i$. Then, for each step $k$ a weak learner $f_k$ is fit to the data set $\left\{ \left( \mathbf{x}_i, r_i \right) \right\}_{i=1}^n$. Residuals are then updated according to $r_i = r_i - \nu f_k \left( \mathbf{x}_i \right)$.
+
+The weak learner is fit by minimising the objective function,
+
+$$
+\mathcal{L} \left( \phi \right) = 
+  \sum_i l \left( \hat{r}_i, r_i \right) + 
+  \sum_k \Omega \left( f_k \right),
+$$
+
+where $l$ is a loss function and $\Omega$ is a penalty function to avoid over-fitting. Terms for L1 and L2 regularization are included within $\Omega$ and so the penalty function can effectively carry out lasso, ridge and elastic net type penalisation.
+
+# Data
+
+Here we present a brief overview of the data and forecasting problem. A detailed discussion of the GEFCom2017 data is provided by @Hong2019-ew. Hourly electricity data for eight zones spanning New England was made available by ISO New England. Hourly weather data comprising dry bulb temperatures and dew point temperatures was also provided. This analysis uses data from January 2005 to April 2017. When training a model to forecast for a particular month I used data from January 2005 up to to two months prior to the start of the forecast period. For example, when forecasting April 2017, only data from January 2005 to January 2017 is used for training^[This two month gap is in general consistent with how data arrived during the competition. To be clear, I do not expect that a two month gap between the end of the training period and start of the forecast horizon improves forecasts. A two month gap is only used to ensure reasonably consistency with competition proceedings.]. Public holiday data was also allowed in the competition. Massachusetts (MASS) is composed of three bottom level zones: Southeast Massachusetts (SEMASS), Western/Central Massachusetts (WCMASS) and Northeast Massachusetts (NEMASSBOST). The remaining bottom level zones are Maine (ME), Connecticut (CT), New Hampshire (NH), Rhode Island (RI) and Vermont (VT). The sum of all eight bottom level zones is designated as "TOTAL". Figure \ref{fig:hierarchy} shows the structure of the hierarchy.
+
+
+```{r hierarchy, fig.cap="Load forecasting hierarchy for GEFCom2017. There are two aggregated zones and eight bottom level zones."}
+knitr::include_graphics("GEFComHierarchy.pdf")
+```
+
+
+
+
+## Electricity demand
+
+Figure \@ref(fig:zone-ts-plot) shows the time series data for one top level zone (Total) and one bottom level zone (Vermont). Daylight saving time (DST) hours have been omitted as they contain either a reading of 0 MW or are the sum of two periods.
+
+```{r zone-ts-plot, fig.cap = "Electricity demand for the total of all zones and the bottom level zone Vermont. Strong seasonality and volatility is observed for both the total and the bottom level zone."}
+train_df %>% 
+  filter(Zone %in% plot_zones) %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = T)) %>% 
+  ggplot(aes(x = ts, y = Demand)) + 
+  geom_line(size = 0.2) +
+  facet_wrap(~Zone, ncol = 1, scales = "free_y") +
+  xlab("Date") + 
+  ylab("Demand (MW)") +
+  ylim(0, NA)
+```
+
+
+## Weather variables
+
+The defined data track of GEFCom2017 only allows dry bulb temperature and dew point temperature to be used as model predictors. Scatter plots of demand and these two temperature variables for Maine are shown in Figure \@ref(fig:plot-demand-temp). Note that a similar relationship is present in all other zones. Figure \@ref(fig:plot-correlation-temp) shows that both variables are strongly correlated except at higher temperatures. It seems reasonable to expect improvement in predictive power by including both temperature variables within the model.
+
+Each bottom level zone has data from one weather station for each of these two temperature variables. Naturally, aggregated zones have several stations available. Weather stations that belonged to an aggregated zone were averaged to obtain temperature variables. Using all weather variables separately was tested against this approach, but it was found that averaged temperature values performed similarly when validating on a test data set.
+
+```{r plot-demand-temp, fig.cap = "Scatter plots of demand and temperature variables in Maine."}
+train_df %>% 
+  filter(Zone == "ME") %>% 
+  select(Demand,
+         `Dry Bulb Temperature` = DryBulb,
+         `Dew Point Temperature` = DewPnt) %>% 
+  gather(var, val, -Demand) %>% 
+  ggplot(aes(x = val, y = Demand)) +
+  geom_point(size = 0.3, alpha = 0.05) +
+  geom_smooth() +
+  facet_wrap(~var, ncol = 1) +
+  ylab("Demand (MW)") +
+  xlab("Temperature (°F)")
+```
+
+```{r plot-correlation-temp, fig.cap = "Correlation between dry bulb temperature and dew point temperature in Maine. A non-linear relationship is evident in this scatter plot."}
+train_df %>% 
+  filter(Zone == "ME") %>% 
+  select(`Dry Bulb Temperature (°F)` = DryBulb,
+         `Dew Point Temperature (°F)` = DewPnt) %>% 
+  ggplot(aes(x = `Dry Bulb Temperature (°F)`, y = `Dew Point Temperature (°F)`)) +
+  geom_point(size = 0.3, alpha = 0.05) +
+  geom_smooth()
+```
+
+## Hierarchy structure
+
+The hierarchy consists of 8 bottom level nodes and 2 aggregated nodes. It is an unbalanced hierarchy with 3 of the bottom level nodes combining to form Massachusetts and the remaining bottom level nodes and Massachusetts aggregating to form the total. A visualisation of of this structure is provided in Figure \ref{fig:hierarchy}.
+
+Figure \ref{fig:hierarchy} can be represented in matrix notation using the summing matrix $\mathbf{S}$ from \@ref(eq:summing-matrix). Expressing the GEFCom2017 hierarchy in the form of \@ref(eq:summing-matrix) gives,
+
+
+$$
+\begin{bmatrix}
+  y_{TOTAL,t} \\
+  y_{ME,t} \\
+  y_{NH,t} \\
+  y_{VT,t} \\
+  y_{CT,t} \\
+  y_{RI,t} \\
+  y_{MASS,t} \\
+  y_{SEMASS,t} \\
+  y_{WCMASS,t} \\
+  y_{NEMASSBOST,t} \\
+\end{bmatrix} =
+  \begin{bmatrix}
+    1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\
+    1 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+    0 & 1 & 0 & 0 & 0 & 0 & 0 & 0 \\
+    0 & 0 & 1 & 0 & 0 & 0 & 0 & 0 \\
+    0 & 0 & 0 & 1 & 0 & 0 & 0 & 0 \\
+    0 & 0 & 0 & 0 & 1 & 0 & 0 & 0 \\
+    0 & 0 & 0 & 0 & 0 & 1 & 1 & 1 \\
+    0 & 0 & 0 & 0 & 0 & 1 & 0 & 0 \\
+    0 & 0 & 0 & 0 & 0 & 0 & 1 & 0 \\
+    0 & 0 & 0 & 0 & 0 & 0 & 0 & 1 \\
+  \end{bmatrix}
+  \begin{bmatrix}
+    y_{ME,t} \\
+    y_{NH,t} \\
+    y_{VT,t} \\
+    y_{CT,t} \\
+    y_{RI,t} \\
+    y_{SEMASS,t} \\
+    y_{WCMASS,t} \\
+    y_{NEMASSBOST,t} \\
+  \end{bmatrix},
+$$
+
+where $y_{k, t}$ is the demand for zone $k$ at time $t$.
+
+# Methodology
+
+The following sections give a detailed description of the forecasting methodology.^[A tutorial with R code is available from [camroach87.github.io](https://camroach87.github.io/post/2018-09-28-gefcom2017-tut-1/).] For a given month I fit a separate model for each zone using a gradient boosting algorithm. I assessed the performance of L1 and L2 regularization using cross-validation. After selecting the regularization parameters that performed best I forecast demand for each zone over the forecast horizon using weather and residual simulations. This created demand simulations for each zone. Each demand simulation was reconciled to ensure that the sum of child nodes were equal to their parent nodes. The final step involved calculating quantiles of the demand simulations for each hour of the forecast horizon.
+
+
+## Training and test data sets
+
+Each month between June 2016 and April 2017 (the final month of the competition) was used as a test data set. While only four test sets (January 2017 to April 2017) were assessed in the competition, this paper expands on this in order to compare the baseline (Vanilla) and boosted models across each month of an entire year.
+
+Models were trained using data from January 2005 to two months prior to the start of the forecast period. This gap is in general consistent with how data arrived on the [ISO New England website](https://www.iso-ne.com/isoexpress/web/reports/load-and-demand/-/tree/zone-info) during the competition, where there was usually a two month processing time for new data. As discussed in Section \@ref(electricity-demand) daylight saving time (DST) hours were omitted. The training data set was used when carrying out parameter tuning via 5-fold cross-validation. Residuals were calculated for the training set and were later used during the residual simulation step (see Section \@ref(residual-resampling)).
+
+## Model specification
+
+### Boosted model
+
+I used a linearly boosted model from the XGBoost library [@R-xgboost]. Models were fit in R [@R-base] using the caret package [@R-caret] to carry out cross validation and parameter tuning. A linear booster was chosen over a tree booster as both gave similar results but the linear booster typically ran faster. 5-fold cross-validation was used when tuning as this offered an acceptable compromise between computational burden and variation in the folds.
+
+A similar approach to @Ziel2016-yz was used when choosing predictors. For zone $k$ the following model was used,
+
+\begin{equation}
+y_{kt} = c_k \left( t \right) + f_k \left( \mathbf{w}_{kt} \right) + \epsilon_{kt},
+  (\#eq:model-xgb)
+\end{equation}
+
+where at time $t$,
+
+* $y_{kt}$ is the demand;
+* $c_k \left( t \right)$ is a linear function that models the effects of calendar variables;
+* $f_k \left( \mathbf{w}_{kt} \right)$ is a linear function that models the effect of weather variables;
+* $\mathbf{w}_{kt}$ is a vector containing all weather and lagged weather variables; and
+* $\epsilon_{kt}$ is the model error.
+
+Equation \@ref(eq:model-xgb) is of the form discussed in Section \@ref(gradient-boosting). Calendar variables in $c_k \left( t \right)$ include,
+
+* Public holidays;
+* Hour of day;
+* Day of week;
+* Day of year; and
+* A trend term which is a natural number ordering the observations.
+
+Weather variables in $\mathbf{w}_{kt}$ include,
+
+* Current dry bulb and dew point temperatures;
+* 72 hourly lags for dry bulb temperature; and
+* 72 hourly lags for dew point temperature.
+
+The choice of 72 hourly lags was made somewhat arbitrarily. The main goal was to include temperature data from the previous three days to capture any thermal inertia effects in buildings. This is an important factor in energy demand [@Ben_Taieb2014-rr]. More lags could well be added, though this would increase the computation time which I wished to avoid. In total there are 156 predictors. Note that predictors were not scaled prior to fitting models.
+
+### Vanilla model
+
+For zone $k$, Tao's Vanilla model [@Hong2010-cy] is,
+
+$$
+\begin{aligned}
+y_{kt} = & \alpha_{0k} + \sum_{m=1}^{11} \alpha_{1km} M_{mt} + \sum_{d=1}^{6} \alpha_{2kd} D_{dt} + 
+           \sum_{h=1}^{23} \alpha_{3kh} H_{ht} + \sum_{d=1}^{6} \sum_{h=1}^{23} \alpha_{4kdh} D_{dt} H_{ht} \\
+         & + \alpha_{5k} \text{Trend}_k + f_k(T_{kt}) + \epsilon_{kt}
+\end{aligned}
+$$
+
+where at time $t$,
+
+* $T_{kt}$ is the dry bulb temperature;
+* $f_k(T_{kt})$ models temperature effects;
+* $M_{mt}$ is a dummy variable for month $m \in \left\{1, 2, \ldots, 11 \right\}$;
+* $D_{dt}$ is a dummy variable for day of week $d \in \left\{1, 2, \ldots, 6 \right\}$;
+* $H_{ht}$ is a dummy variable for hour $h \in \left\{1, 2, \ldots, 23 \right\}$; and
+* $\text{Trend}_k$ is a natural number that orders the observations.
+
+The temperature effects are modelled by,
+
+$$
+\begin{aligned}
+f_k(T_{kt}) = & \beta_{1k} T_{kt} + \beta_{2k} T_{kt}^2 + \beta_{3k} T_{kt}^3 \\
+         & + \sum_{m=1}^{11} (\beta_{4km} T_{kt} + \beta_{5km} T_{kt}^2 + \beta_{6km} T_{kt}^3) M_{mt} \\
+         & + \sum_{h=1}^{23} (\beta_{7kh} T_{kt} + \beta_{8kh} T_{kt}^2 + \beta_{9kh} T_{kt}^3) H_{ht}.
+\end{aligned}
+$$
+
+Weather simulations for the models are constructed by shuffling historical weather data back and forwards a maximum of 4 days. Each historical year and shuffled time series within serves as a simulation. As I was attempting to simulate actual demand values I also simulated residuals using variable-length block bootstrapping. Residuals were not simulated in the Vanilla model which was consistent with the benchmark method of GEFCom2017.
+
+### Regularization
+
+Due to the high dimensionality of our model there was a risk of over-fitting to the training data. To manage this risk, I fit several models with L1 and L2 regularization and different penalty values. 5-fold cross validation was then performed on the training data to pick the best model. These regularized models were also tested against a baseline model. The baseline model chosen was Tao's Vanilla model [@Hong2010-cy] which has previously been used as a benchmarking model [@Hong2014-bb] and was also used in GEFCom2017.
+
+The change in root-mean-square error (RMSE) during 5-fold cross-validation is shown in Figure \@ref(fig:cv-performance-zones). Both the L1 and L2 regularized models outperformed the Vanilla model. With a sufficiently large penalty the L1 model gave the best RMSE results.
+
+```{r cv-performance-zones, fig.cap="5-fold cross-validation RMSE scores. The x-axis gives the magnitude of the penalty size for both the L1 and L2 regularization. Results for one aggregated zone and one bottom level zone are shown. Similar results are observed for all other zones."}
+results_xgb %>% 
+  filter(Zone %in% plot_zones) %>% 
+  gather(Regularization, Penalty, c(alpha, lambda)) %>% 
+  group_by(Zone, Penalty, Regularization) %>% 
+  summarise(RMSE = mean(RMSE)) %>% 
+  ungroup() %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = T)) %>% # order subplots
+  ggplot(aes(x = Penalty, y = RMSE, colour = Regularization)) +
+  geom_line() + 
+  geom_hline(data = results_vanilla %>% 
+               filter(Zone %in% plot_zones) %>% 
+               group_by(Zone) %>% 
+               summarise(RMSE = mean(RMSE)) %>% 
+               ungroup() %>% 
+               mutate(Zone = factor(Zone, levels = all_zones, ordered = T)),
+             linetype = "dashed",
+             aes(yintercept = RMSE, colour = "Vanilla")) +
+  scale_x_continuous(trans = "log",
+                     labels = function(x) round(x, 0)) +
+  facet_wrap(~Zone, scales = "free_y") +
+  scale_colour_discrete(
+    name="Model",
+    breaks=c("alpha", "lambda", "Vanilla"),
+    labels=c("L1", "L2", "Vanilla")) +
+  theme(legend.position = "bottom")
+```
+
+
+
+## Simulating in a hierarchy
+
+The challenge requires competitors to forecast 9 quantiles (10th, 20th, ... and 90th) for every hour in a future month. This is an ex-ante forecasting problem as we do not have any data for predictors in this situation. To forecast a demand distribution I first simulated weather scenarios. Residuals were simulated by sampling from days with similar calendar characteristics.
+
+As the New England zones form a hierarchy it is necessary to preserve correlation between them. For example, weather in one zone will be highly correlated with an adjacent zone. Hence, simulations need to reflect this. Correlation between zones is also present for residuals (Figure \ref{fig:resid-correlation-zones}) and so care was taken when simulating residuals as well.
+
+### Weather simulations
+
+Weather simulations were produced using the shifted-date method [@Xie2016-ru]. Historical weather time series were shifted back and forward by a maximum of 4 days each way. This resulted in 9 weather scenarios for each year. 11 years of historical weather data were used which gave a total of 99 weather scenarios. This approach has the advantage of ensuring realistic weather simulations are produced as well as preserving weather correlation between zones.
+
+A double seasonal block bootstrap approach similar to @Hyndman2010-ui was tested against this shifting approach but was found to perform worse. This is most likely due to the unrealistic discontinuities that are introduced at block boundaries during the bootstrapping process. This was not an issue for their paper's goal of predicting maximum demand, but is in this instance.
+
+### Residual resampling
+
+When predicting demand for simulated weather data the fitted model is only returning a conditional mean. The error term in \@ref(eq:model-xgb) also needs to be accounted for. To do this, I sampled from the historical residuals and added this sample to the predicted demand. This combination of conditional mean and residual produced a realistic demand simulation. The historical residuals were calculated by predicting demand on the training data set and taking the difference between the predicted and actual demand.
+
+When simulating residuals I sampled a sequence of historical residuals to preserve correlation between adjacent observations in the time series. A variable-length block bootstrapping approach similar to @Hyndman2010-ui was used. A block of variable length was sampled from historical years at close to the same point of the year. The day of year the the block started from was allowed to vary by as much as seven days from the day of year for which I required residuals. The length of the block was uniformly distributed between 14 and 21 days. These numbers were somewhat arbitrary and can be varied, but produced reasonably realistic auto-correlation functions (ACFs) when compared to the actual (see Figure \ref{fig:acf-residuals} for an example). Correlations in the simulated residuals tend to be lower than the actuals due to discontinuities introduced at the borders of the blocks. To try and reduce the magnitude of the discontinuities, block boundaries occurred at midnight when the variance of the residuals was usually lowest (Figure \ref{fig:resid-variance}).
+
+It was also important to make sure that whatever dates were chosen when resampling were consistent between zones. Sampling different historical dates for each zone would lead to a break down in the inter-zone residual correlation resulting in less realistic simulations. Residual correlations between zones are shown in Figure \ref{fig:resid-correlation-zones}.
+
+
+```{r resid-variance, fig.cap="Residual variance for each hourly period of the day. Variances have been calculated using residuals from all 12 training data sets. Results for one aggregated zone and one bottom level zone are shown though similar residual variance behaviour is observed in all other zones. Residual variance is highest during the middle of the day and lowest close to midnight.", fig.height=4}
+resid_df_test %>% 
+  bind_rows() %>% 
+  filter(Zone %in% plot_zones) %>% 
+  group_by(Zone, Period) %>% 
+  summarise(`Residual variance` = var(Residual)) %>% 
+  ungroup() %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE),
+         Period = as.numeric(Period)) %>% 
+  ggplot(aes(x=Period, y = `Residual variance`)) + 
+  geom_col(width = 0, colour = "black") +
+  geom_point() +
+  facet_wrap(~Zone, scales = "free_y") +
+  scale_x_continuous(breaks = 0:6*4)
+```
+
+```{r resid-correlation-zones, fig.cap="Correlation of zone residuals based on 1,000 points sampled from the hierarchy. Positive correlation is observed between all zones.", fig.height=11, fig.width=11}
+resid_df_train %>% 
+  bind_rows(.id = "FCST_MONTH") %>% 
+  select(FCST_MONTH, ts, Zone, Residual) %>%
+  spread(Zone, Residual) %>%
+  select(!!all_zones) %>%
+  sample_n(1000) %>%
+  ggpairs(lower = list(continuous = wrap("points", alpha = 0.2))) +
+  theme(panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 90))
+```
+
+
+To check the sampled residuals form a realistic time series their ACF is compared against the ACF of the historical data (Figure \@ref(fig:acf-residuals)). The simulated residuals appear to have a similar ACF as the actuals. The ACF of the simulated residuals are lower than the actuals' ACF as expected, but to an acceptable degree.
+
+
+```{r acf-residuals, fig.cap="Auto-correlation functions for historical residuals and simulated residuals in February 2017 for one aggregated zone and one bottom level zone."}
+acf_calc <- function(x) {
+  x <- acf(x, plot = FALSE, lag.max = 48)
+  x <- as.vector(x$acf)
+  return(x)
+}
+
+iM <- "February"
+
+acf_df <- list()
+for (iZ in all_zones) {
+  acf_hist <- acf_calc(filter(resid_df_test[[iM]], Zone == iZ)$Residual)
+  
+  simulation_list <- unique(fcst_bs_df[[iM]]$Simulation)
+  acf_df[[iZ]] <- sapply(simulation_list,
+                   function(x) {
+                     fcst_bs_df[[iM]] %>% 
+                       filter(Simulation == !!x,
+                              Zone == iZ) %>% 
+                       pull(Residual) %>% 
+                       acf_calc()
+                   }) %>% 
+    as.data.frame() %>% 
+    mutate(Lag = 0:48,
+           Historical = acf_hist)
+}
+
+acf_df <- bind_rows(acf_df, .id = "Zone") %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE))
+
+ggplot() +
+  geom_line(data = acf_df %>% 
+              select(Zone, Lag, !!simulation_list) %>% 
+              filter(Zone %in% plot_zones) %>% 
+              gather(var, Correlation, -c(Zone, Lag), factor_key = TRUE),
+            aes(x = Lag, y = Correlation, group = var, colour = "Simulations"),
+            alpha = 0.3) +
+  geom_line(data = acf_df %>%
+              select(Zone, Lag, Correlation = Historical) %>% 
+              filter(Zone %in% plot_zones),
+            aes(x = Lag, y = Correlation, colour = "Historical")) +
+  scale_colour_manual(name = NULL, values = c("black", "grey")) +
+  theme(legend.position = "bottom") +
+  facet_wrap(~Zone)
+```
+
+
+## Hierarchical reconciliation
+
+Once a demand simulation has been created it is necessary to reconcile all of the time series in the hierarchy. Here I test several methods of accomplishing this.
+
+### Choosing weights for reconciliation
+
+Several methods for reconciling the hierarchy were tested. The first involved using only the summing matrix $\mathbf{S}$ as per \@ref(eq:recon-summing). The other two methods were based on specifying different weight matrices in \@ref(eq:recon-wls).
+
+As mentioned, the entities of $\mathbf{W}$ can be calculated based on the variances of $\epsilon_h$. This works well with time series models such as ARIMA and exponential smoothing where each fitted value is already a one-step ahead forecast, but for our model this is not the case. Computing one-step ahead forecasts for the historical data would require refitting the model at each step which is computationally prohibitive. As an alternative, I propose two different weight matrices. The first is based on the mean values of each zone's demand and the second is calculated from variance of the residuals. The inverse matrices are specified below,
+
+$$
+\mathbf{W}_\text{mean}^{-1} = \frac{1}{\sum_{k} \bar{y}_k} \cdot
+  \text{diag} \left( \left\{ \bar{y}_{k} \right\}_{k=1}^K \right),
+$$
+
+$$
+\mathbf{W}_\text{var}^{-1} = \text{diag} \left( \left\{ \sigma_k^2 \right\}_{k=1}^K \right),
+$$
+
+where $\text{diag} \left( \left\{ x_k \right\}_{k=1}^K \right)$ represents a diagonal matrix with elements $x_1, x_2, \ldots, x_K$, $K$ is the total number of zones and $\sigma_k^2$ is the variance of the residuals for zone $k$.
+
+The intuition behind these weights follows from our goal of shifting the more accurate forecasts less than the inaccurate forecasts when reconciling. In the absence of one-step ahead forecasts the variance of residuals should serve as a useful proxy. Since residuals and demand are correlated the mean weight matrix may also prove useful.
+
+
+# Discussion
+
+## Reconciliation results
+
+Monthly RMSE scores for each hierarchical reconciliation method are shown in Figure \@ref(fig:rmse-hts-recon-methods) and Table \@ref(tab:rmse-hts-recon-methods-tab). All 12 test data sets have been used to produce these results. Overall, the WLS approach using $\mathbf{W}_\text{var}$ gives the best performance. The WLS approach using $\mathbf{W}_\text{mean}$ performed slightly worse. Using the OLS approach is the worst performed of the three reconciliation methods.
+
+To see why the OLS approach performs worse than the WLS approaches we can compare the forecasts. Figure \@ref(fig:reconciliation-plot) shows one of the simulations' base demand forecasts and the reconciled forecasts for one day in the forecast period. While the aggregated zone's reconciled forecasts look reasonable the bottom level forecast has severe variance introduced when using the OLS methodology. This variance appears in bottom level zones that only have one parent zone (Total). It so happens that OLS adjustments made to base forecasts for these bottom level zones are of a comparable magnitude to the adjustments made to the Massachusetts aggregated zone, whereas the bottom level zones making up Massachusetts receive significantly smaller adjustments. This discrepancy in adjustments appears to be caused by the unbalanced structure of the hierarchy.
+
+Given these results the WLS reconciliation method using $\mathbf{W}_\text{var}$ as the weight matrix was chosen to reconcile base forecasts.
+
+```{r rmse-hts-recon-methods, fig.cap="Hierarchical reconciliation results. The RMSE for each forecast month from May 2016 to April 2017 is plotted. The contoured lines are violin plots and represent the density. Similar results are observed in all other zones."}
+method_levels <- c("WLS (residual variance)", "WLS (mean)", "OLS", "Unreconciled")
+
+rmse_df_zones <- resid_df_test %>% 
+  bind_rows(.id = "FCST_MONTH") %>% 
+  group_by(FCST_MONTH, Zone) %>% 
+  do(get_rmse(.)) %>% 
+  rename(OLS = Summing, `WLS (mean)` = Mean,
+         `WLS (residual variance)` = `Residual variance`)
+
+gg_colour_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+rmse_df_zones %>%
+  ungroup() %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE)) %>% 
+  filter(Zone %in% plot_zones) %>% 
+  gather(Method, RMSE, -c(FCST_MONTH, Zone)) %>% 
+  mutate(Method = factor(Method, levels = method_levels,
+                         ordered = TRUE)) %>% 
+  ggplot(aes(x = Method, y = RMSE, colour = Method)) + 
+  geom_violin() +
+  geom_jitter(alpha = 0.3) +
+  facet_wrap(~Zone, ncol = 2) +
+  coord_flip() +
+  scale_colour_manual(values = c(gg_colour_hue(5))) +
+  theme(legend.position = "none")
+```
+
+
+```{r rmse-hts-recon-methods-tab-data}
+rmse_df <- resid_df_test %>% 
+  bind_rows(.id = "FCST_MONTH") %>% 
+  group_by(FCST_MONTH, Year) %>% 
+  do(get_rmse(.)) %>% 
+  ungroup() %>% 
+  mutate(FCST_MONTH = factor(FCST_MONTH, ordered = TRUE, levels = forecast_months$Month),
+         Month = paste(FCST_MONTH, Year)) %>% 
+  arrange(Year, FCST_MONTH) %>% 
+  select(Month, Unreconciled, OLS = Summing, `WLS (mean)` = Mean,
+         `WLS (residual variance)` = `Residual variance`)
+```
+
+```{r rmse-hts-recon-methods-tab}
+kable(rmse_df,
+      booktabs = TRUE,
+      caption = "RMSE scores for each reconciliation method averaged across all zones.",
+      digits = 1)
+```
+
+
+```{r reconciliation-plot, fig.cap="Original and reconciled forecasts using different weights. Note that I have deliberately chosen a day where over-forecasting occurs to better show how the OLS reconciliation method introduces variance."}
+p_date <- p_date <- fcst_start_date + days(2)
+p_sim <- sample(unique(fcst_bs_df[[iM]]$Simulation), 1)
+
+resid_df_test %>% 
+  bind_rows() %>% 
+  filter(Date %in% p_date) %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE)) %>% 
+  filter(Zone %in% plot_zones) %>% 
+  ggplot() +
+  geom_line(aes(x = ts, y = Prediction, colour = "Unreconciled")) +
+  geom_line(aes(x = ts, y = Prediction_rec, colour = "OLS")) +
+  geom_line(aes(x = ts, y = Prediction_rec_mean, colour = "WLS (mean)")) +
+  geom_line(aes(x = ts, y = Prediction_rec_res_var, colour = "WLS (residual variance)")) +
+  geom_line(aes(x = ts, y = Demand, colour = "Actual")) +
+  facet_wrap(~Zone, ncol = 2, scales = "free_y") +
+  ylab("Demand (MW)") +
+  xlab("Time") +
+  theme(legend.position = "bottom") +
+  labs(colour = NULL) +
+  scale_colour_manual(values = c("black", gg_colour_hue(5)),
+                      labels = c("Actual", "Unreconciled", "OLS", "WLS (mean)",
+                                 "WLS (residual variance)"),
+                      breaks = c("Actual", "Unreconciled", "OLS", "WLS (mean)",
+                                 "WLS (residual variance)")) +
+  scale_x_datetime(breaks = date_breaks("4 hour"),
+                   labels=date_format("%H:%M"))
+```
+
+
+## Quantile forecast results
+
+Quantile forecasts were produced with the WLS reconciliation approach using $\mathbf{W}_\text{var}$ weights and L1-regularization as this model appeared to perform best. An example of the quantile forecasts for one aggregated zone and one bottom level zone is shown in Figure \@ref(fig:hist-and-quantile-plots). By inspection it appears as though the quantile forecasts are capturing the variance in the actuals well. Benchmarking is carried out against the Vanilla model to better understand how well the model is performing.
+
+```{r hist-and-quantile-plots, fig.cap="Actuals and quantile forecasts in first week of January 2017. The shaded area shows the maximum and minimum simulated demand values."}
+p_date <- dmy("1/1/2017") + days(0:6)
+
+actuals_plot_data <- resid_df_test[["January"]] %>% 
+  filter(date(ts) %in% p_date) %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE))
+
+quantile_plot_data <- quantile_fcst_xgb %>% 
+  filter(date(ts) %in% p_date) %>% 
+  mutate(Zone = factor(Zone, levels = all_zones, ordered = TRUE))
+  
+p_quantile_col <- scales::seq_gradient_pal("springgreen3", "red")(1:9/10)
+
+p <- ggplot() +
+  geom_ribbon(data = quantile_plot_data %>% 
+                select(Zone, ts, Q0, Q100) %>% 
+                filter(Zone %in% plot_zones) %>% 
+                mutate(Week = week(ts)),
+              aes(x = ts, ymin = Q0, ymax = Q100), alpha = 0.1) +
+  geom_line(data = quantile_plot_data %>% 
+              select(Zone, ts, Q10, Q20, Q30, Q40, Q50, Q60, Q70, Q80, Q90) %>% 
+              filter(Zone %in% plot_zones) %>% 
+              gather(Quantile, Demand, -c(ts, Zone)) %>% 
+              mutate(Week = week(ts)),
+            aes(x = ts, y = Demand, colour = Quantile)) +
+  geom_line(data = actuals_plot_data %>% 
+              filter(Zone %in% plot_zones) %>% 
+              mutate(Week = week(ts)),
+            aes(x = ts, y = Demand, colour = "Actual"))  +
+  facet_wrap(~Zone, scales = "free_y", ncol = 1) +
+  xlab("Date") +
+  ylab("Demand (MW)") +
+  scale_colour_manual(name = NULL,
+                      values = c("black", p_quantile_col))
+print(p)
+```
+
+## Benchmarking against Vanilla model
+
+The pinball loss scoring function can be used to assess quantile forecasts [@Gneiting2011-wu]. For a probability level, $\tau$, the pinball loss function is defined as,
+
+
+$$
+L_\tau \left( y, q_\tau \right) =
+\begin{cases}
+  \tau(y-q_\tau) & \text{ for } y \geq q_\tau,\\
+  (1-\tau)(q_\tau-y) & \text{ for } q_\tau > y.
+\end{cases}
+$$
+
+
+A lower expected pinball loss score indicates better performance. The expected pinball loss for each model and zone can be estimated by taking the mean of all observed $L_\tau \left( y_{kt}, q_{kt\tau} \right)$, where $q_{kt\tau}$ is the quantile forecast at probability level $\tau$ for zone $k$ at time $t$.
+
+A comparison of the Vanilla and boosted^[WLS reconciliation approach using $\mathbf{W}_\text{var}$ weights and L1-regularization.] models is given in Tables \@ref(tab:pinball-loss-scores-zone) and \@ref(tab:pinball-loss-scores-month). The boosted model almost always outperforms the Vanilla model. The only exception is for August 2016 when both models appear to have poor performance relative to other months.
+
+
+```{r pinball-loss-scores-zone}
+quantile_fcst_xgb %>% 
+  mutate(Model = "Boosted") %>% 
+  bind_rows(quantile_fcst_vanilla %>% 
+              mutate(Model = "Vanilla")) %>% 
+  select(-c(Q0, Q100)) %>% 
+  gather(Quantile, Prediction, starts_with("Q")) %>% 
+  mutate(tau = as.numeric(str_extract(Quantile, "[[:digit:]]+"))) %>% 
+  inner_join(resid_df_test %>% 
+               bind_rows(.id = "FCST_MONTH") %>% 
+               select(FCST_MONTH, ts, Zone, Demand)) %>% 
+  do(data.frame(.,
+                pinball_loss(.$tau, y = .$Demand, q = .$Prediction))) %>% 
+  group_by(Model, Zone) %>% 
+  summarise(L = mean(L)) %>% 
+  spread(Model, L) %>% 
+  mutate(`Percentage improvement` = percent(1-Boosted/Vanilla)) %>% 
+  kable(booktabs = TRUE,
+        caption = "Expected pinball loss scores for each zone averaged across all 12 test sets. Lower values indicate better performance.",
+        digits = 1,
+        align = "lrrr")
+```
+
+
+```{r pinball-loss-scores-month}
+quantile_fcst_xgb %>% 
+  mutate(Model = "Boosted") %>% 
+  bind_rows(quantile_fcst_vanilla %>% 
+              mutate(Model = "Vanilla")) %>% 
+  select(-c(Q0, Q100)) %>% 
+  gather(Quantile, Prediction, starts_with("Q")) %>% 
+  mutate(tau = as.numeric(str_extract(Quantile, "[[:digit:]]+"))) %>% 
+  inner_join(resid_df_test %>% 
+               bind_rows(.id = "FCST_MONTH") %>% 
+               select(FCST_MONTH, ts, Zone, Demand, Year)) %>% 
+  do(data.frame(.,
+                pinball_loss(.$tau, y = .$Demand, q = .$Prediction))) %>% 
+  group_by(Model, FCST_MONTH, Year) %>% 
+  summarise(L = mean(L)) %>% 
+  spread(Model, L) %>% 
+  ungroup() %>% 
+  mutate(`Percentage improvement` = percent(1-Boosted/Vanilla),
+         FCST_MONTH = factor(FCST_MONTH, ordered = TRUE, levels = forecast_months$Month),
+         Month = paste(FCST_MONTH, Year)) %>% 
+  arrange(Year, FCST_MONTH) %>% 
+  select(Month, Vanilla, Boosted, `Percentage improvement`) %>% 
+  kable(booktabs = TRUE,
+        caption = "Expected pinball loss scores for each forecast month averaged across all zones. Lower values indicate better performance.",
+        digits = 1,
+        align = "lrrr")
+```
+
+
+## Future research
+
+Here I have explored the performance of the boosted algorithm in one context. However, it is potentially interesting to see how such a model might perform when forecasting over different horizons. Another area that might be of interest is focusing on other methods for dealing with unbalanced hierarchies, for example - adding artificial nodes to balance the hierarchy. Both of these are left as future research topics.
+
+# Conclusion
+
+In this paper I have presented a methodology for producing probabilistic hierarchical forecasts. A demand model based on linear gradient boosting was shown to outperform a commonly used benchmark model. Additionally, the impact of both L1 and L2 regularization was found to improve the model fit. The best performance was observed using a sufficiently large L1 penalty.
+
+Weather simulations were produced by shifting the weather history back and forth by up to four days. Residual simulations used a variable-length block bootstrapping approach. Forecast reconciliation between nodes of the hierarchy was carried out using several different methods. It was found that using a weight matrix based on the variance of residuals performed best. Advantages of this approach are that bottom level zonal forecasts correctly sum to aggregated zonal forecasts and forecast accuracy improves compared to unreconciled models.
+
+Finally, the quantile forecasts produced by the gradient boosted model outperformed a commonly used baseline model. Quantile forecasts were assessed using the pinball loss function. The gradient boosted model performed better in all zones in the hierarchy over a year of monthly forecasts.
+
+# Acknowledgements
+
+I am grateful for the financial support of Buildings Alive (Fund: 1752291; Grant: 512031) and to its CEO Craig Roussac. I would also like to acknowledge the invaluable support of my PhD supervisors Rob Hyndman and Souhaib Ben Taieb. Finally, I would like to thank the referees of the paper for their time and thoughtful feedback.
+
+
+# References {-}
